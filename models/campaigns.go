@@ -2,10 +2,12 @@ package models
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"sort"
 	"strings"
 	txttpl "text/template"
 
@@ -239,6 +241,46 @@ func (c *Campaign) CompileTemplate(f template.FuncMap) error {
 	}
 
 	return nil
+}
+
+// TplHash returns a hash of all the fields that influence template
+// compilation (base template, body, subject, altbody, headers). It's used
+// to cache compiled templates and to invalidate the cache when any of the
+// fields change, triggering a recompile.
+func (c *Campaign) TplHash() string {
+	h := sha256.New()
+
+	// write writes a length-prefixed string so that concatenated
+	// fields can't produce hash collisions.
+	write := func(s string) {
+		fmt.Fprintf(h, "%d:", len(s))
+		h.Write([]byte(s))
+	}
+
+	write(c.TemplateBody)
+	write(c.ContentType)
+	write(c.Body)
+	write(c.Subject)
+	write(c.AltBody.String)
+
+	// Hash headers in a deterministic (sorted) order as Go map
+	// iteration order is random.
+	fmt.Fprintf(h, "%d:", len(c.Headers))
+	for _, set := range c.Headers {
+		keys := make([]string, 0, len(set))
+		for k := range set {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		fmt.Fprintf(h, "%d:", len(keys))
+		for _, k := range keys {
+			write(k)
+			write(set[k])
+		}
+	}
+
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // hasTplExpr checks whether a given string has a Go template expression with {{ and  }}.

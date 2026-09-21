@@ -8,6 +8,7 @@ import (
 	"net/textproto"
 	"strings"
 	"sync"
+	txttpl "text/template"
 	"time"
 
 	"maps"
@@ -75,11 +76,17 @@ type Manager struct {
 	tpls    map[int]*models.Template
 	tplsMut sync.RWMutex
 
+	// Compiled campaign templates cached by template ID so that the same
+	// template isn't re-parsed for every campaign/message that uses it.
+	// Entries are invalidated by a hash of the template content.
+	campTpls    map[int]*campTpl
+	campTplsMut sync.RWMutex
+
 	// Links generated using Track() are cached here so as to not query
-	// the database for the link UUID for every message sent. This has to
-	// be locked as it may be used externally when previewing campaigns.
-	links    map[string]string
-	linksMut sync.RWMutex
+	// the database for the link UUID for every message sent. It's a
+	// sync.Map as it's read-heavy: once a link is registered, every
+	// subsequent message in the campaign only reads it.
+	links sync.Map
 
 	nextPipes chan *pipe
 	campMsgQ  chan CampaignMessage
@@ -91,7 +98,19 @@ type Manager struct {
 	slidingCount int
 	slidingStart time.Time
 
-	tplFuncs template.FuncMap
+	tplFuncs     template.FuncMap
+	campTplFuncs template.FuncMap
+}
+
+// campTpl is a cached compiled campaign template. The hash of the
+// campaign's template-affecting fields is stored alongside so that
+// any change to the template content invalidates the cached entry.
+type campTpl struct {
+	hash       string
+	tpl        *template.Template
+	subjectTpl *txttpl.Template
+	altBodyTpl *template.Template
+	headerTpls []map[string]*txttpl.Template
 }
 
 // CampaignMessage represents an instance of campaign message to be pushed out,
@@ -170,13 +189,14 @@ func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 		messengers:   make(map[string]Messenger),
 		pipes:        make(map[int]*pipe),
 		tpls:         make(map[int]*models.Template),
-		links:        make(map[string]string),
+		campTpls:     make(map[int]*campTpl),
 		nextPipes:    make(chan *pipe, 1000),
 		campMsgQ:     make(chan CampaignMessage, cfg.Concurrency*cfg.MessageRate*2),
 		msgQ:         make(chan models.Message, cfg.Concurrency*cfg.MessageRate*2),
 		slidingStart: time.Now(),
 	}
 	m.tplFuncs = m.makeGnericFuncMap()
+	m.campTplFuncs = m.makeCampaignFuncMap()
 
 	return m
 }
@@ -327,6 +347,10 @@ func (m *Manager) DeleteTpl(id int) {
 	m.tplsMut.Lock()
 	delete(m.tpls, id)
 	m.tplsMut.Unlock()
+
+	m.campTplsMut.Lock()
+	delete(m.campTpls, id)
+	m.campTplsMut.Unlock()
 }
 
 // GetTpl returns a cached template.
@@ -342,9 +366,59 @@ func (m *Manager) GetTpl(id int) (*models.Template, error) {
 	return tpl, nil
 }
 
+// CompileCampaignTpl compiles a campaign's template and caches the compiled
+// result by the campaign's template ID. On subsequent calls, if the hash of
+// the campaign's template-affecting fields (template body, campaign body,
+// subject, altbody, headers) matches the cached entry, the cached compilation
+// is reused instead of re-parsing the base and content templates. Any change
+// to the template content changes the hash and triggers a recompile.
+func (m *Manager) CompileCampaignTpl(c *models.Campaign) error {
+	var (
+		hash = c.TplHash()
+		key  = c.TemplateID.Int
+	)
+
+	m.campTplsMut.RLock()
+	cached, ok := m.campTpls[key]
+	m.campTplsMut.RUnlock()
+
+	if ok && cached.hash == hash {
+		c.Tpl = cached.tpl
+		c.SubjectTpl = cached.subjectTpl
+		c.AltBodyTpl = cached.altBodyTpl
+		c.HeaderTpls = cached.headerTpls
+		return nil
+	}
+
+	if err := c.CompileTemplate(m.TemplateFuncs(c)); err != nil {
+		return err
+	}
+
+	m.campTplsMut.Lock()
+	m.campTpls[key] = &campTpl{
+		hash:       hash,
+		tpl:        c.Tpl,
+		subjectTpl: c.SubjectTpl,
+		altBodyTpl: c.AltBodyTpl,
+		headerTpls: c.HeaderTpls,
+	}
+	m.campTplsMut.Unlock()
+
+	return nil
+}
+
 // TemplateFuncs returns the template functions to be applied into
-// compiled campaign templates.
+// compiled campaign templates. The funcs are built once at init and shared
+// across all campaigns as they hold no per-campaign state; campaign context
+// is derived from the message being rendered. The campaign argument is
+// retained for backwards compatibility.
 func (m *Manager) TemplateFuncs(c *models.Campaign) template.FuncMap {
+	return m.campTplFuncs
+}
+
+// makeCampaignFuncMap builds the template func map applied to compiled
+// campaign templates. It's built once and shared across campaigns.
+func (m *Manager) makeCampaignFuncMap() template.FuncMap {
 	f := template.FuncMap{
 		"TrackLink": func(url string, msg *CampaignMessage) string {
 			if m.cfg.DisableTracking {
@@ -383,7 +457,7 @@ func (m *Manager) TemplateFuncs(c *models.Campaign) template.FuncMap {
 			return fmt.Sprintf(m.cfg.OptinURL, msg.Subscriber.UUID, "")
 		},
 		"MessageURL": func(msg *CampaignMessage) string {
-			return fmt.Sprintf(m.cfg.MessageURL, c.UUID, msg.Subscriber.UUID)
+			return fmt.Sprintf(m.cfg.MessageURL, msg.Campaign.UUID, msg.Subscriber.UUID)
 		},
 		"ArchiveURL": func() string {
 			return m.cfg.ArchiveURL
@@ -589,12 +663,9 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 
 	url = strings.ReplaceAll(url, "&amp;", "&")
 
-	m.linksMut.RLock()
-	if uu, ok := m.links[url]; ok {
-		m.linksMut.RUnlock()
-		return fmt.Sprintf(m.cfg.LinkTrackURL, uu, campUUID, subUUID)
+	if uu, ok := m.links.Load(url); ok {
+		return fmt.Sprintf(m.cfg.LinkTrackURL, uu.(string), campUUID, subUUID)
 	}
-	m.linksMut.RUnlock()
 
 	// Register link.
 	uu, err := m.store.CreateLink(url)
@@ -605,9 +676,7 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 		return url
 	}
 
-	m.linksMut.Lock()
-	m.links[url] = uu
-	m.linksMut.Unlock()
+	m.links.Store(url, uu)
 
 	return fmt.Sprintf(m.cfg.LinkTrackURL, uu, campUUID, subUUID)
 }
