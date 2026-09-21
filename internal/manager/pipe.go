@@ -31,8 +31,10 @@ func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 		return nil, fmt.Errorf("unknown messenger %s on campaign %s", c.Messenger, c.Name)
 	}
 
-	// Load the template.
-	if err := c.CompileTemplate(m.TemplateFuncs(c)); err != nil {
+	// Compile (or fetch from cache) the campaign's templates. The cache is keyed
+	// by TemplateID and content fingerprint, so repeated runs of a campaign and
+	// campaigns sharing a template don't pay the parse cost again.
+	if err := m.CompileCampaignTpl(c); err != nil {
 		return nil, err
 	}
 

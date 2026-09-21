@@ -75,11 +75,22 @@ type Manager struct {
 	tpls    map[int]*models.Template
 	tplsMut sync.RWMutex
 
+	// compiledTpls caches compiled campaign templates keyed by TemplateID and
+	// then by a content fingerprint. Campaigns sharing the same template (and
+	// content) reuse one *models.CompiledTpl instead of recompiling the base and
+	// content templates for every subscriber run.
+	compiledTpls    map[int]map[uint64]*compiledTplEntry
+	compiledTplsMut sync.RWMutex
+	compileFlights  map[string]*compileFlight
+
 	// Links generated using Track() are cached here so as to not query
 	// the database for the link UUID for every message sent. This has to
-	// be locked as it may be used externally when previewing campaigns.
-	links    map[string]string
-	linksMut sync.RWMutex
+	// be concurrency safe as it's hit by every message worker. sync.Map avoids
+	// RWMutex contention on the mostly-read map. linkFlights coalesces
+	// concurrent registrations of the same unseen URL into a single DB insert.
+	links       sync.Map
+	linkFlights map[string]*linkFlight
+	linkMut     sync.Mutex
 
 	nextPipes chan *pipe
 	campMsgQ  chan CampaignMessage
@@ -92,6 +103,28 @@ type Manager struct {
 	slidingStart time.Time
 
 	tplFuncs template.FuncMap
+
+	// campFuncs is a single shared FuncMap for all campaigns. The functions are
+	// closures over the manager but take their campaign/message context from the
+	// template dot (CampaignMessage) at render time, so one map can be reused
+	// by every compilation, which is what makes compiled templates cacheable.
+	campFuncs template.FuncMap
+}
+
+// compiledTplEntry is a single cached campaign compilation.
+type compiledTplEntry struct {
+	baseHash uint64
+	tpl      *models.CompiledTpl
+}
+
+// compileFlight coalesces concurrent compilations of the same content.
+type compileFlight struct{ done chan struct{} }
+
+// linkFlight deduplicates concurrent store.CreateLink calls for one URL.
+type linkFlight struct {
+	done chan struct{}
+	uu   string
+	err  error
 }
 
 // CampaignMessage represents an instance of campaign message to be pushed out,
@@ -166,17 +199,20 @@ func New(cfg Config, store Store, i *i18n.I18n, l *log.Logger) *Manager {
 		fnNotify: func(subject string, data any) error {
 			return notifs.NotifySystem(subject, notifs.TplCampaignStatus, data, nil)
 		},
-		log:          l,
-		messengers:   make(map[string]Messenger),
-		pipes:        make(map[int]*pipe),
-		tpls:         make(map[int]*models.Template),
-		links:        make(map[string]string),
-		nextPipes:    make(chan *pipe, 1000),
-		campMsgQ:     make(chan CampaignMessage, cfg.Concurrency*cfg.MessageRate*2),
-		msgQ:         make(chan models.Message, cfg.Concurrency*cfg.MessageRate*2),
-		slidingStart: time.Now(),
+		log:            l,
+		messengers:     make(map[string]Messenger),
+		pipes:          make(map[int]*pipe),
+		tpls:           make(map[int]*models.Template),
+		compiledTpls:   make(map[int]map[uint64]*compiledTplEntry),
+		compileFlights: make(map[string]*compileFlight),
+		linkFlights:    make(map[string]*linkFlight),
+		nextPipes:      make(chan *pipe, 1000),
+		campMsgQ:       make(chan CampaignMessage, cfg.Concurrency*cfg.MessageRate*2),
+		msgQ:           make(chan models.Message, cfg.Concurrency*cfg.MessageRate*2),
+		slidingStart:   time.Now(),
 	}
 	m.tplFuncs = m.makeGnericFuncMap()
+	m.campFuncs = m.makeCampaignFuncMap()
 
 	return m
 }
@@ -327,6 +363,11 @@ func (m *Manager) DeleteTpl(id int) {
 	m.tplsMut.Lock()
 	delete(m.tpls, id)
 	m.tplsMut.Unlock()
+
+	// Evict any campaign compilations derived from this base template.
+	m.compiledTplsMut.Lock()
+	delete(m.compiledTpls, id)
+	m.compiledTplsMut.Unlock()
 }
 
 // GetTpl returns a cached template.
@@ -342,9 +383,18 @@ func (m *Manager) GetTpl(id int) (*models.Template, error) {
 	return tpl, nil
 }
 
-// TemplateFuncs returns the template functions to be applied into
-// compiled campaign templates.
-func (m *Manager) TemplateFuncs(c *models.Campaign) template.FuncMap {
+// TemplateFuncs returns the template functions applied into compiled campaign
+// templates. The campaign argument is accepted for API compatibility but is no
+// longer captured in a per-campaign closure: all per-message context is read
+// from the CampaignMessage passed at render time, so the same FuncMap (and
+// therefore the same compiled templates) can be shared by every campaign.
+func (m *Manager) TemplateFuncs(_ *models.Campaign) template.FuncMap {
+	return m.campFuncs
+}
+
+// makeCampaignFuncMap builds the single shared FuncMap used to compile all
+// campaign templates.
+func (m *Manager) makeCampaignFuncMap() template.FuncMap {
 	f := template.FuncMap{
 		"TrackLink": func(url string, msg *CampaignMessage) string {
 			if m.cfg.DisableTracking {
@@ -383,7 +433,7 @@ func (m *Manager) TemplateFuncs(c *models.Campaign) template.FuncMap {
 			return fmt.Sprintf(m.cfg.OptinURL, msg.Subscriber.UUID, "")
 		},
 		"MessageURL": func(msg *CampaignMessage) string {
-			return fmt.Sprintf(m.cfg.MessageURL, c.UUID, msg.Subscriber.UUID)
+			return fmt.Sprintf(m.cfg.MessageURL, msg.Campaign.UUID, msg.Subscriber.UUID)
 		},
 		"ArchiveURL": func() string {
 			return m.cfg.ArchiveURL
@@ -396,6 +446,92 @@ func (m *Manager) TemplateFuncs(c *models.Campaign) template.FuncMap {
 	maps.Copy(f, m.tplFuncs)
 
 	return f
+}
+
+// CompileCampaignTpl returns the campaign's compiled templates, serving the
+// result from the in-memory cache and compiling only when no entry exists for
+// the campaign's TemplateID and content fingerprint. A template edit or a
+// campaign content change changes the fingerprint, triggering a recompile.
+func (m *Manager) CompileCampaignTpl(c *models.Campaign) error {
+	baseHash, contentHash := c.TplFingerprint()
+	id := c.TemplateID.Int
+	flightKey := fmt.Sprintf("%d:%d:%d", id, baseHash, contentHash)
+
+	// Fast path: serve from the cache.
+	m.compiledTplsMut.RLock()
+	if bucket, ok := m.compiledTpls[id]; ok {
+		if e, ok := bucket[contentHash]; ok && e.baseHash == baseHash {
+			m.compiledTplsMut.RUnlock()
+			c.SetCompiledTpl(e.tpl)
+
+			return nil
+		}
+	}
+	m.compiledTplsMut.RUnlock()
+
+	// Register (or join) a flight that coalesces compilations of this content.
+	m.compiledTplsMut.Lock()
+	if bucket, ok := m.compiledTpls[id]; ok {
+		if e, ok := bucket[contentHash]; ok && e.baseHash == baseHash {
+			m.compiledTplsMut.Unlock()
+			c.SetCompiledTpl(e.tpl)
+
+			return nil
+		}
+	}
+
+	if fl, ok := m.compileFlights[flightKey]; ok {
+		m.compiledTplsMut.Unlock()
+		<-fl.done
+
+		// The compiling goroutine stores the result in the cache on success.
+		// On failure the flight is removed without a cache entry, so retry.
+		m.compiledTplsMut.RLock()
+		var e *compiledTplEntry
+		if bucket, ok := m.compiledTpls[id]; ok {
+			e = bucket[contentHash]
+		}
+		m.compiledTplsMut.RUnlock()
+		if e == nil {
+			return m.CompileCampaignTpl(c)
+		}
+		c.SetCompiledTpl(e.tpl)
+
+		return nil
+	}
+
+	fl := &compileFlight{done: make(chan struct{})}
+	m.compileFlights[flightKey] = fl
+	m.compiledTplsMut.Unlock()
+
+	// Compile outside the read lock so concurrent renders and cache hits for
+	// other templates are not blocked. Concurrent goroutines for the same
+	// content wait on the flight created above instead of compiling in parallel.
+	tpl, err := models.CompileCampaignTpl(c, m.campFuncs)
+	if err != nil {
+		m.compiledTplsMut.Lock()
+		delete(m.compileFlights, flightKey)
+		m.compiledTplsMut.Unlock()
+		close(fl.done)
+
+		return err
+	}
+
+	m.compiledTplsMut.Lock()
+	bucket, ok := m.compiledTpls[id]
+	if !ok {
+		bucket = make(map[uint64]*compiledTplEntry)
+		m.compiledTpls[id] = bucket
+	}
+	bucket[contentHash] = &compiledTplEntry{baseHash: baseHash, tpl: tpl}
+	delete(m.compileFlights, flightKey)
+	m.compiledTplsMut.Unlock()
+
+	close(fl.done)
+
+	c.SetCompiledTpl(tpl)
+
+	return nil
 }
 
 func (m *Manager) GenericTemplateFuncs() template.FuncMap {
@@ -589,25 +725,59 @@ func (m *Manager) trackLink(url, campUUID, subUUID string) string {
 
 	url = strings.ReplaceAll(url, "&amp;", "&")
 
-	m.linksMut.RLock()
-	if uu, ok := m.links[url]; ok {
-		m.linksMut.RUnlock()
-		return fmt.Sprintf(m.cfg.LinkTrackURL, uu, campUUID, subUUID)
+	if v, ok := m.links.Load(url); ok {
+		return fmt.Sprintf(m.cfg.LinkTrackURL, v.(string), campUUID, subUUID)
 	}
-	m.linksMut.RUnlock()
 
-	// Register link.
-	uu, err := m.store.CreateLink(url)
+	// Coalesce concurrent misses for the same URL so that a burst of messages
+	// referencing an unseen link triggers a single CreateLink DB call.
+	m.linkMut.Lock()
+	if fl, ok := m.linkFlights[url]; ok {
+		m.linkMut.Unlock()
+		<-fl.done
+		if fl.err != nil {
+			return url
+		}
+
+		return fmt.Sprintf(m.cfg.LinkTrackURL, fl.uu, campUUID, subUUID)
+	}
+
+	fl := &linkFlight{done: make(chan struct{})}
+	m.linkFlights[url] = fl
+	m.linkMut.Unlock()
+
+	// Re-check the cache after acquiring the flight; another goroutine may have
+	// registered it between the initial lookup and the lock acquisition above.
+	uu, err := func() (string, error) {
+		if v, ok := m.links.Load(url); ok {
+			return v.(string), nil
+		}
+
+		return m.store.CreateLink(url)
+	}()
+
 	if err != nil {
 		m.log.Printf("error registering tracking for link '%s': %v", url, err)
+
+		fl.err = err
+		close(fl.done)
+
+		m.linkMut.Lock()
+		delete(m.linkFlights, url)
+		m.linkMut.Unlock()
 
 		// If the registration fails, fail over to the original URL.
 		return url
 	}
 
-	m.linksMut.Lock()
-	m.links[url] = uu
-	m.linksMut.Unlock()
+	m.links.Store(url, uu)
+
+	fl.uu = uu
+	close(fl.done)
+
+	m.linkMut.Lock()
+	delete(m.linkFlights, url)
+	m.linkMut.Unlock()
 
 	return fmt.Sprintf(m.cfg.LinkTrackURL, uu, campUUID, subUUID)
 }

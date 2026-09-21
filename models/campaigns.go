@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"html/template"
+	"io"
+	"sort"
 	"strings"
 	txttpl "text/template"
 
@@ -136,9 +139,52 @@ func (camps Campaigns) LoadStats(stmt *sqlx.Stmt) error {
 	return nil
 }
 
-// CompileTemplate compiles a campaign body template into its base
-// template and sets the resultant template to Campaign.Tpl.
+// CompiledTpl holds the compiled template artifacts of a campaign. A single
+// CompiledTpl can be shared across campaigns (and across thousands of messages)
+// as html/template and text/template are safe for concurrent execution. The
+// manager caches it keyed by TemplateID and the content fingerprints returned
+// by Campaign.TplFingerprint(), recompiling only when content changes.
+type CompiledTpl struct {
+	Tpl        *template.Template
+	SubjectTpl *txttpl.Template
+	AltBodyTpl *template.Template
+
+	// HeaderTpls holds the compiled text/template for every header value that
+	// contains a template expression. Header detection and compilation is done
+	// once here instead of on every render. Nil entries indicate static headers.
+	HeaderTpls []map[string]*txttpl.Template
+}
+
+// SetCompiledTpl assigns a cached CompiledTpl's artifacts to the campaign so
+// that the existing per-campaign fields used during rendering are populated
+// without a recompile.
+func (c *Campaign) SetCompiledTpl(t *CompiledTpl) {
+	c.Tpl = t.Tpl
+	c.SubjectTpl = t.SubjectTpl
+	c.AltBodyTpl = t.AltBodyTpl
+	c.HeaderTpls = t.HeaderTpls
+}
+
+// CompileTemplate compiles a campaign body template into its base template and
+// assigns the resultant artifacts to the campaign. Prefer the manager's cached
+// compilation path; this wrapper exists for one-off compiles (previews, public
+// pages) where no cache is available.
 func (c *Campaign) CompileTemplate(f template.FuncMap) error {
+	t, err := CompileCampaignTpl(c, f)
+	if err != nil {
+		return err
+	}
+
+	c.SetCompiledTpl(t)
+
+	return nil
+}
+
+// CompileCampaignTpl compiles the subject, base + body, alt body and any
+// templated headers of a campaign into a reusable CompiledTpl.
+func CompileCampaignTpl(c *Campaign, f template.FuncMap) (*CompiledTpl, error) {
+	out := &CompiledTpl{}
+
 	// If the subject line has a template string, compile it.
 	if hasTplExpr(c.Subject) {
 		subj := c.Subject
@@ -149,9 +195,9 @@ func (c *Campaign) CompileTemplate(f template.FuncMap) error {
 		var txtFuncs map[string]any = f
 		subjTpl, err := txttpl.New(ContentTpl).Funcs(txtFuncs).Parse(subj)
 		if err != nil {
-			return fmt.Errorf("error compiling subject: %v", err)
+			return nil, fmt.Errorf("error compiling subject: %v", err)
 		}
-		c.SubjectTpl = subjTpl
+		out.SubjectTpl = subjTpl
 	}
 
 	// Compile the base template.
@@ -167,14 +213,14 @@ func (c *Campaign) CompileTemplate(f template.FuncMap) error {
 
 	baseTPL, err := template.New(BaseTpl).Funcs(f).Parse(body)
 	if err != nil {
-		return fmt.Errorf("error compiling base template: %v", err)
+		return nil, fmt.Errorf("error compiling base template: %v", err)
 	}
 
 	// If the format is markdown, convert Markdown to HTML.
 	if c.ContentType == CampaignContentTypeMarkdown {
 		var b bytes.Buffer
 		if err := markdown.Convert([]byte(c.Body), &b); err != nil {
-			return err
+			return nil, err
 		}
 		body = b.String()
 	} else {
@@ -188,14 +234,14 @@ func (c *Campaign) CompileTemplate(f template.FuncMap) error {
 
 	msgTpl, err := template.New(ContentTpl).Funcs(f).Parse(body)
 	if err != nil {
-		return fmt.Errorf("error compiling message: %v", err)
+		return nil, fmt.Errorf("error compiling message: %v", err)
 	}
 
-	out, err := baseTPL.AddParseTree(ContentTpl, msgTpl.Tree)
+	tpl, err := baseTPL.AddParseTree(ContentTpl, msgTpl.Tree)
 	if err != nil {
-		return fmt.Errorf("error inserting child template: %v", err)
+		return nil, fmt.Errorf("error inserting child template: %v", err)
 	}
-	c.Tpl = out
+	out.Tpl = tpl
 
 	if hasTplExpr(c.AltBody.String) {
 		b := c.AltBody.String
@@ -204,41 +250,75 @@ func (c *Campaign) CompileTemplate(f template.FuncMap) error {
 		}
 		bTpl, err := template.New(ContentTpl).Funcs(f).Parse(b)
 		if err != nil {
-			return fmt.Errorf("error compiling alt plaintext message: %v", err)
+			return nil, fmt.Errorf("error compiling alt plaintext message: %v", err)
 		}
-		c.AltBodyTpl = bTpl
+		out.AltBodyTpl = bTpl
 	}
 
-	// Compile any header values that contain template expressions.
+	// Detect and compile templated headers in a single pass. Most campaigns have
+	// no templated headers, in which case this stays nil and headers are rendered
+	// as-is on every message without any per-header scanning.
+	var hdrTpls []map[string]*txttpl.Template
+	for i, set := range c.Headers {
+		for hdr, val := range set {
+			if !hasTplExpr(val) {
+				continue
+			}
+			if hdrTpls == nil {
+				hdrTpls = make([]map[string]*txttpl.Template, len(c.Headers))
+			}
+			if hdrTpls[i] == nil {
+				hdrTpls[i] = make(map[string]*txttpl.Template, len(set))
+			}
+
+			var txtFuncs map[string]any = f
+			tpl, err := txttpl.New(ContentTpl).Funcs(txtFuncs).Parse(val)
+			if err != nil {
+				return nil, fmt.Errorf("error compiling header %q: %v", hdr, err)
+			}
+			hdrTpls[i][hdr] = tpl
+		}
+	}
+	out.HeaderTpls = hdrTpls
+
+	return out, nil
+}
+
+// TplFingerprint returns two hashes that uniquely identify the compiled state
+// of a campaign. baseHash covers the shared base template (TemplateBody) and
+// is the primary cache bucket key (by TemplateID); contentHash covers
+// campaign-specific inputs (subject, body, alt body, headers and content
+// type). A change in either hash invalidates the cached compilation.
+func (c *Campaign) TplFingerprint() (baseHash, contentHash uint64) {
+	base := fnv.New64a()
+	io.WriteString(base, c.TemplateBody)
+
+	content := fnv.New64a()
+	io.WriteString(content, c.ContentType)
+	io.WriteString(content, "\x00")
+	io.WriteString(content, c.Subject)
+	io.WriteString(content, "\x00")
+	io.WriteString(content, c.Body)
+	io.WriteString(content, "\x00")
+	io.WriteString(content, c.AltBody.String)
+
+	// Sort header names so that map iteration order doesn't perturb the hash.
+	keys := make([]string, 0, len(c.Headers))
 	for _, set := range c.Headers {
-		for _, val := range set {
-			if hasTplExpr(val) {
-				c.HeaderTpls = make([]map[string]*txttpl.Template, len(c.Headers))
-				break
-			}
-		}
-		if c.HeaderTpls != nil {
-			break
+		for k := range set {
+			keys = append(keys, k)
 		}
 	}
-	if c.HeaderTpls != nil {
-		var txtFuncs map[string]any = f
-		for i, set := range c.Headers {
-			c.HeaderTpls[i] = make(map[string]*txttpl.Template, len(set))
-			for hdr, val := range set {
-				if !hasTplExpr(val) {
-					continue
-				}
-				tpl, err := txttpl.New(ContentTpl).Funcs(txtFuncs).Parse(val)
-				if err != nil {
-					return fmt.Errorf("error compiling header %q: %v", hdr, err)
-				}
-				c.HeaderTpls[i][hdr] = tpl
+	sort.Strings(keys)
+	for i, set := range c.Headers {
+		for _, k := range keys {
+			if v, ok := set[k]; ok {
+				fmt.Fprintf(content, "\x00%d:%s=%s", i, k, v)
 			}
 		}
 	}
 
-	return nil
+	return base.Sum64(), content.Sum64()
 }
 
 // hasTplExpr checks whether a given string has a Go template expression with {{ and  }}.
